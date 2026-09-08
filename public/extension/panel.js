@@ -3,11 +3,13 @@
 
   // ===== State =====
   var mediaItems = [];
+  var itemsByUrl = Object.create(null); // dedupe: one card per URL
   var typeFilter = "all";
   var textFilter = "";
   var minSize = 0;
   var autoDownload = false;
   var isListening = false;
+  var resyncTimer = null;
 
   // ===== DOM refs =====
   var grid = document.getElementById("media-grid");
@@ -47,6 +49,7 @@
   }
 
   function getFileName(url) {
+    if (url.indexOf("data:") === 0) return "inline_image_" + (mediaItems.length + 1);
     try {
       var u = new URL(url);
       var name = u.pathname.split("/").pop();
@@ -58,11 +61,33 @@
   }
 
   function getDomain(url) {
+    if (url.indexOf("data:") === 0) return "inline (data URI)";
     try {
       return new URL(url).hostname;
     } catch (e) {
       return "";
     }
+  }
+
+  // Chrome-specific extension field on HAR entries — a reliable fallback
+  // when the response has no usable mime type or file extension (e.g.
+  // an API endpoint serving an image from an extensionless URL).
+  function getResourceType(request) {
+    try {
+      return (request._resourceType || "").toLowerCase();
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function dataUriMime(url) {
+    var m = /^data:([^;,]+)?/.exec(url);
+    return (m && m[1]) || "";
+  }
+
+  function estimateDataUriSize(url) {
+    var comma = url.indexOf(",");
+    return comma >= 0 ? Math.floor((url.length - comma - 1) * 0.75) : 0;
   }
 
   function formatSize(bytes) {
@@ -73,12 +98,14 @@
     return (bytes / 1073741824).toFixed(2) + " GB";
   }
 
-  function classifyMedia(url, mime) {
+  function classifyMedia(url, mime, resourceType) {
     var ext = getExtension(url);
     if (mime && mime.indexOf("image/") === 0) return "image";
     if (mime && mime.indexOf("video/") === 0) return "video";
     if (IMAGE_EXTS.indexOf(ext) >= 0) return "image";
     if (VIDEO_EXTS.indexOf(ext) >= 0) return "video";
+    if (resourceType === "image") return "image";
+    if (resourceType === "media") return "video";
     return null;
   }
 
@@ -92,6 +119,44 @@
     return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;");
   }
 
+  // ===== Capture (shared by network requests and inline data-URI images) =====
+  function registerItem(url, mime, size, resourceType) {
+    if (!url) return;
+
+    var type = classifyMedia(url, mime, resourceType);
+    if (!type) return;
+
+    // One card per URL. A later sighting of the same URL (e.g. picked up
+    // again by both the live listener and a HAR resync) just tops up the
+    // size/mime instead of piling up duplicate cards.
+    var existing = itemsByUrl[url];
+    if (existing) {
+      if (size && !existing.size) existing.size = size;
+      if (mime && !existing.mime) existing.mime = mime;
+      return;
+    }
+
+    var item = {
+      id: url + "_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+      url: url,
+      type: type,
+      mime: mime,
+      size: size,
+      domain: getDomain(url),
+      name: getFileName(url),
+      timestamp: Date.now()
+    };
+
+    itemsByUrl[url] = item;
+    mediaItems.push(item);
+    updateCounts();
+    renderGrid();
+
+    if (autoDownload) {
+      downloadMedia(item);
+    }
+  }
+
   // ===== Network interception =====
   function onRequestFinished(request) {
     var url = null;
@@ -101,7 +166,12 @@
       return;
     }
 
-    if (!url || url.indexOf("data:") === 0 || url.indexOf("blob:") === 0) return;
+    // blob: object URLs only resolve inside the page's own JS realm — the
+    // extension can't fetch their bytes, so they're out of scope.
+    // data: URIs (inline base64 images) ARE kept: Chrome's Network domain
+    // does emit a request-finished-style entry for <img src="data:...">
+    // loads, and skipping them here was dropping every one of those images.
+    if (!url || url.indexOf("blob:") === 0) return;
 
     var mime = "";
     var size = 0;
@@ -128,27 +198,32 @@
       } catch (e) {}
     }
 
-    var type = classifyMedia(url, mime);
-    if (!type) return;
-
-    var item = {
-      id: url + "_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
-      url: url,
-      type: type,
-      mime: mime,
-      size: size,
-      domain: getDomain(url),
-      name: getFileName(url),
-      timestamp: Date.now()
-    };
-
-    mediaItems.push(item);
-    updateCounts();
-    renderGrid();
-
-    if (autoDownload) {
-      downloadMedia(item);
+    // data: entries often carry no response/content metadata at all — the
+    // mime type is right there in the URL prefix, so read it from there.
+    if (!mime && url.indexOf("data:") === 0) {
+      mime = dataUriMime(url);
+      if (!size) size = estimateDataUriSize(url);
     }
+
+    registerItem(url, mime, size, getResourceType(request));
+  }
+
+  // Re-pull the DevTools Network panel's HAR log and merge it in. This is
+  // the safety net for requests the live onRequestFinished listener drops —
+  // a known Chrome quirk (worse on hard reloads) — and for anything that
+  // finished while this panel's page hadn't been opened/focused yet, so
+  // capture keeps working across reloads and SPA navigations instead of
+  // only ever seeing the first batch.
+  function resyncFromHAR() {
+    try {
+      chrome.devtools.network.getHAR(function (harLog) {
+        if (harLog && harLog.entries) {
+          for (var i = 0; i < harLog.entries.length; i++) {
+            onRequestFinished(harLog.entries[i]);
+          }
+        }
+      });
+    } catch (e) {}
   }
 
   function attachNetworkListener() {
@@ -160,15 +235,10 @@
         // DevTools only loads this panel's page the first time the user
         // clicks its tab, so requests that already finished (e.g. all the
         // images a page loaded before MediaHarvest was opened) never reach
-        // onRequestFinished. Backfill them from the Network panel's own
-        // already-recorded HAR log.
-        chrome.devtools.network.getHAR(function (harLog) {
-          if (harLog && harLog.entries) {
-            for (var i = 0; i < harLog.entries.length; i++) {
-              onRequestFinished(harLog.entries[i]);
-            }
-          }
-        });
+        // onRequestFinished. Backfill them immediately, then keep
+        // resyncing periodically as a safety net (see resyncFromHAR).
+        resyncFromHAR();
+        resyncTimer = setInterval(resyncFromHAR, 2500);
 
         isListening = true;
         statusBadge.textContent = "Listening";
@@ -181,6 +251,17 @@
       statusBadge.textContent = "Error";
       statusBadge.classList.add("paused");
     }
+  }
+
+  // ===== Inline data-URI images (never hit the network, so the listener
+  // above can never see them — reported by content.js instead) =====
+  function attachDataUriListener() {
+    if (!chrome.runtime || !chrome.runtime.onMessage) return;
+    chrome.runtime.onMessage.addListener(function (message, sender) {
+      if (!message || message.action !== "dataImage") return;
+      if (!sender.tab || sender.tab.id !== chrome.devtools.inspectedWindow.tabId) return;
+      registerItem(message.url, message.mime, message.size, "image");
+    });
   }
 
   // ===== Rendering =====
@@ -430,6 +511,7 @@
 
   btnClear.addEventListener("click", function () {
     mediaItems = [];
+    itemsByUrl = Object.create(null);
     updateCounts();
     renderGrid();
   });
@@ -450,5 +532,6 @@
 
   // ===== Init =====
   attachNetworkListener();
+  attachDataUriListener();
   renderGrid();
 })();
