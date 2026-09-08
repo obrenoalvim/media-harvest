@@ -40,6 +40,27 @@
   var IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "apng"];
   var VIDEO_EXTS = ["mp4", "webm", "ogg", "ogv", "mov", "m4v", "mkv", "avi", "m3u8", "ts"];
 
+  // Mirrors background.js's EXT_BY_MIME — used to give zip entries a real
+  // extension when the source url had none (extensionless CDN paths,
+  // signed URLs, data: URIs), same as the single-file download path already does.
+  var EXT_BY_MIME = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+    "image/bmp": ".bmp",
+    "image/x-icon": ".ico",
+    "image/avif": ".avif",
+    "image/apng": ".apng",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/ogg": ".ogv",
+    "video/quicktime": ".mov",
+    "video/x-msvideo": ".avi",
+    "video/x-matroska": ".mkv"
+  };
+
   // ===== Utilities =====
   function getExtension(url) {
     try {
@@ -530,6 +551,18 @@
     }
   }
 
+  function ensureExtension(name, mime) {
+    name = name || "media_" + Date.now();
+    var dot = name.lastIndexOf(".");
+    var hasRealExt = dot > 0 && dot > name.lastIndexOf("/"); // not just a dotted folder segment
+    if (hasRealExt) return name;
+
+    var cleanMime = (mime || "").split(";")[0].trim().toLowerCase();
+    var ext = EXT_BY_MIME[cleanMime];
+    if (!ext) ext = cleanMime.indexOf("video/") === 0 ? ".mp4" : cleanMime.indexOf("image/") === 0 ? ".jpg" : ".bin";
+    return name + ext;
+  }
+
   function uniqueZipName(usedNames, name) {
     name = name || "media_" + Date.now();
     if (!usedNames[name]) {
@@ -577,10 +610,13 @@
         return fetch(item.url, { credentials: "include" })
           .then(function (res) {
             if (!res.ok) throw new Error("HTTP " + res.status);
-            return res.blob();
+            // the real response header beats our possibly-stale captured mime
+            var mime = (res.headers && res.headers.get("content-type")) || item.mime || "";
+            return res.blob().then(function (blob) { return { blob: blob, mime: mime }; });
           })
-          .then(function (blob) {
-            zip.file(uniqueZipName(usedNames, item.name), blob);
+          .then(function (result) {
+            var name = ensureExtension(item.name, result.mime || item.mime);
+            zip.file(uniqueZipName(usedNames, name), result.blob);
           })
           .catch(function (e) {
             failed++;
