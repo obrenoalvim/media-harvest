@@ -496,8 +496,7 @@
     }
   }
 
-  function downloadAllFiltered() {
-    var items = getFilteredItems();
+  function downloadIndividually(items) {
     for (var i = 0; i < items.length; i++) {
       (function (item, delay) {
         setTimeout(function () {
@@ -505,6 +504,76 @@
         }, delay);
       })(items[i], i * 200);
     }
+  }
+
+  function uniqueZipName(usedNames, name) {
+    name = name || "media_" + Date.now();
+    if (!usedNames[name]) {
+      usedNames[name] = 1;
+      return name;
+    }
+    var n = ++usedNames[name];
+    var dot = name.lastIndexOf(".");
+    return dot > 0 ? name.slice(0, dot) + "_" + n + name.slice(dot) : name + "_" + n;
+  }
+
+  // One file per click means one confirmation dialog / disk write per item —
+  // painful once there are more than a handful. Bundle everything into a
+  // single zip instead, so "Download All" is really one download.
+  function downloadAllFiltered() {
+    var items = getFilteredItems();
+    if (!items.length) return;
+
+    if (typeof JSZip === "undefined") {
+      downloadIndividually(items); // vendor/jszip.min.js failed to load — fall back
+      return;
+    }
+
+    var originalLabel = btnDownloadAll.innerHTML;
+    btnDownloadAll.disabled = true;
+    btnDownloadAll.textContent = "Zipping " + items.length + "...";
+
+    var zip = new JSZip();
+    var usedNames = Object.create(null);
+
+    Promise.all(
+      items.map(function (item) {
+        return fetch(item.url)
+          .then(function (res) { return res.blob(); })
+          .then(function (blob) {
+            zip.file(uniqueZipName(usedNames, item.name), blob);
+          })
+          .catch(function (e) {
+            console.error("[MediaHarvest] zip: failed to fetch", item.url, e);
+          });
+      })
+    )
+      .then(function () {
+        return zip.generateAsync({ type: "blob" });
+      })
+      .then(function (zipBlob) {
+        var zipUrl = URL.createObjectURL(zipBlob);
+        chrome.downloads.download(
+          {
+            url: zipUrl,
+            filename: "mediaharvest_" + Date.now() + ".zip",
+            saveAs: false,
+            conflictAction: "uniquify"
+          },
+          function () {
+            // give the download a moment to pick up the blob before releasing it
+            setTimeout(function () { URL.revokeObjectURL(zipUrl); }, 60000);
+          }
+        );
+      })
+      .catch(function (e) {
+        console.error("[MediaHarvest] zip build failed, falling back to individual downloads:", e);
+        downloadIndividually(items);
+      })
+      .then(function () {
+        btnDownloadAll.disabled = false;
+        btnDownloadAll.innerHTML = originalLabel;
+      });
   }
 
   // ===== Event handlers (all via addEventListener — CSP-safe for Brave) =====
