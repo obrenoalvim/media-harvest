@@ -4,6 +4,9 @@
   // ===== State =====
   var mediaItems = [];
   var itemsByUrl = Object.create(null); // dedupe: one card per URL
+  var dismissedHashes = new Set(); // urls cleared by the user — never re-add these
+  var DISMISSED_STORAGE_KEY = "mediaharvest_dismissed";
+  var DISMISSED_MAX = 5000; // ponytail: FIFO cap so this can't grow forever across a long session
   var typeFilter = "all";
   var textFilter = "";
   var minSize = 0;
@@ -85,6 +88,27 @@
     return (m && m[1]) || "";
   }
 
+  // Short, fixed-size id for a url — used for the dismissed-list so a
+  // handful of huge base64 data: URIs don't blow past chrome.storage's quota.
+  function hashUrl(url) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < url.length; i++) {
+      h ^= url.charCodeAt(i);
+      h = (h * 0x01000193) >>> 0;
+    }
+    return h.toString(36);
+  }
+
+  function persistDismissed() {
+    try {
+      if (!chrome.storage || !chrome.storage.local) return;
+      var list = Array.from(dismissedHashes).slice(-DISMISSED_MAX);
+      var toStore = {};
+      toStore[DISMISSED_STORAGE_KEY] = list;
+      chrome.storage.local.set(toStore);
+    } catch (e) {}
+  }
+
   function estimateDataUriSize(url) {
     var comma = url.indexOf(",");
     return comma >= 0 ? Math.floor((url.length - comma - 1) * 0.75) : 0;
@@ -122,6 +146,7 @@
   // ===== Capture (shared by network requests and inline data-URI images) =====
   function registerItem(url, mime, size, resourceType) {
     if (!url) return;
+    if (dismissedHashes.has(hashUrl(url))) return; // user cleared this one — stay gone
 
     var type = classifyMedia(url, mime, resourceType);
     if (!type) return;
@@ -510,6 +535,12 @@
   });
 
   btnClear.addEventListener("click", function () {
+    // Remember what was cleared so the next HAR resync (it still has these
+    // in its log) doesn't just bring them straight back.
+    for (var i = 0; i < mediaItems.length; i++) {
+      dismissedHashes.add(hashUrl(mediaItems[i].url));
+    }
+    persistDismissed();
     mediaItems = [];
     itemsByUrl = Object.create(null);
     updateCounts();
@@ -531,7 +562,26 @@
   });
 
   // ===== Init =====
-  attachNetworkListener();
-  attachDataUriListener();
+  // Load the dismissed list first — otherwise the initial HAR backfill can
+  // race ahead and re-add something the user already cleared last session.
+  function startCapture() {
+    attachNetworkListener();
+    attachDataUriListener();
+  }
+
+  try {
+    if (chrome.storage && chrome.storage.local) {
+      chrome.storage.local.get(DISMISSED_STORAGE_KEY, function (result) {
+        var stored = (result && result[DISMISSED_STORAGE_KEY]) || [];
+        for (var i = 0; i < stored.length; i++) dismissedHashes.add(stored[i]);
+        startCapture();
+      });
+    } else {
+      startCapture();
+    }
+  } catch (e) {
+    startCapture();
+  }
+
   renderGrid();
 })();

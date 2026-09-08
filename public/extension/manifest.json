@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MediaHarvest — DevTools Media Inspector",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Capture, filter, and download images & videos directly from DevTools network requests. Works in Chrome and Brave.",
   "icons": {
     "16": "icons/icon16.png",
