@@ -33,6 +33,8 @@
   var modalDownload = document.getElementById("modal-download");
   var modalClose = document.getElementById("modal-close");
   var currentPreviewItem = null;
+  var toastEl = document.getElementById("toast");
+  var toastTimer = null;
 
   // ===== Constants =====
   var IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "apng"];
@@ -141,6 +143,15 @@
   function escapeAttr(s) {
     if (!s) return "";
     return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;");
+  }
+
+  function showToast(message, kind) {
+    if (!toastEl) return;
+    toastEl.textContent = message;
+    toastEl.className = "toast" + (kind ? " " + kind : "");
+    toastEl.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.hidden = true; }, 4000);
   }
 
   // ===== Capture (shared by network requests and inline data-URI images) =====
@@ -486,13 +497,26 @@
           mime: item.mime || ""
         },
         function (response) {
+          // This was the silent-failure bug: chrome.runtime.lastError only
+          // covers messaging itself. The background's own download failure
+          // (response.success === false, e.g. the URL 404'd, got blocked,
+          // or the filename was rejected) was never checked, so a failed
+          // download just did nothing with zero feedback.
           if (chrome.runtime.lastError) {
             console.error("[MediaHarvest] sendMessage error:", chrome.runtime.lastError.message);
+            showToast("Download failed: " + chrome.runtime.lastError.message, "error");
+            return;
+          }
+          if (!response || response.success === false) {
+            var reason = (response && response.error) || "unknown error";
+            console.error("[MediaHarvest] Download failed for", item.url, "-", reason);
+            showToast('Download failed for "' + item.name + '": ' + reason, "error");
           }
         }
       );
     } catch (e) {
       console.error("[MediaHarvest] Download failed:", e);
+      showToast("Download failed: " + e.message, "error");
     }
   }
 
@@ -520,38 +544,66 @@
   // One file per click means one confirmation dialog / disk write per item —
   // painful once there are more than a handful. Bundle everything into a
   // single zip instead, so "Download All" is really one download.
+  //
+  // Every stage reports visible progress on the button itself: with no
+  // feedback, a batch that's genuinely just slow (lots of large images) is
+  // indistinguishable from one that's silently broken.
   function downloadAllFiltered() {
     var items = getFilteredItems();
     if (!items.length) return;
 
     if (typeof JSZip === "undefined") {
-      downloadIndividually(items); // vendor/jszip.min.js failed to load — fall back
+      showToast("Zip library didn't load — downloading files individually instead.", "error");
+      downloadIndividually(items);
       return;
     }
 
     var originalLabel = btnDownloadAll.innerHTML;
     btnDownloadAll.disabled = true;
-    btnDownloadAll.textContent = "Zipping " + items.length + "...";
 
     var zip = new JSZip();
     var usedNames = Object.create(null);
+    var fetched = 0;
+    var failed = 0;
+    var total = items.length;
+
+    function updateFetchProgress() {
+      btnDownloadAll.textContent = "Fetching " + fetched + "/" + total + (failed ? " (" + failed + " failed)" : "") + "...";
+    }
+    updateFetchProgress();
 
     Promise.all(
       items.map(function (item) {
-        return fetch(item.url)
-          .then(function (res) { return res.blob(); })
+        return fetch(item.url, { credentials: "include" })
+          .then(function (res) {
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return res.blob();
+          })
           .then(function (blob) {
             zip.file(uniqueZipName(usedNames, item.name), blob);
           })
           .catch(function (e) {
+            failed++;
             console.error("[MediaHarvest] zip: failed to fetch", item.url, e);
+          })
+          .then(function () {
+            fetched++;
+            updateFetchProgress();
           });
       })
     )
       .then(function () {
-        return zip.generateAsync({ type: "blob" });
+        if (fetched - failed === 0) {
+          // nothing usable came back — zipping an empty archive would just
+          // look like another silent failure, so stop here and say so.
+          throw new Error("could not fetch any of the " + total + " file(s) — they may have expired or be blocked");
+        }
+        return zip.generateAsync({ type: "blob" }, function (metadata) {
+          btnDownloadAll.textContent = "Compressing " + Math.round(metadata.percent) + "%...";
+        });
       })
       .then(function (zipBlob) {
+        btnDownloadAll.textContent = "Starting download...";
         var zipUrl = URL.createObjectURL(zipBlob);
         chrome.downloads.download(
           {
@@ -560,14 +612,22 @@
             saveAs: false,
             conflictAction: "uniquify"
           },
-          function () {
+          function (downloadId) {
             // give the download a moment to pick up the blob before releasing it
             setTimeout(function () { URL.revokeObjectURL(zipUrl); }, 60000);
+            if (chrome.runtime.lastError || !downloadId) {
+              showToast("Zip download failed: " + (chrome.runtime.lastError ? chrome.runtime.lastError.message : "unknown error"), "error");
+              return;
+            }
+            var msg = "Downloaded " + (fetched - failed) + " file(s) as one zip.";
+            if (failed) msg += " " + failed + " failed to fetch.";
+            showToast(msg, failed ? "error" : "success");
           }
         );
       })
       .catch(function (e) {
-        console.error("[MediaHarvest] zip build failed, falling back to individual downloads:", e);
+        console.error("[MediaHarvest] zip build failed:", e);
+        showToast("Zip failed (" + e.message + ") — downloading files individually instead.", "error");
         downloadIndividually(items);
       })
       .then(function () {
